@@ -4,30 +4,43 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import ToolCall from "./tool-call";
 import Message from "./message";
 import Annotations from "./annotations";
-import { Item } from "@/lib/assistant";
+import McpToolsList from "./mcp-tools-list";
+import McpApproval from "./mcp-approval";
+import { Item, McpApprovalRequestItem } from "@/lib/assistant";
+import LoadingMessage from "./loading-message";
+import useConversationStore from "@/stores/useConversationStore";
 
 interface ChatProps {
   items: Item[];
   onSendMessage: (message: string) => void;
+  onApprovalResponse: (approve: boolean, id: string) => void;
 }
 
-const Chat: React.FC<ChatProps> = ({ items, onSendMessage }) => {
+const Chat: React.FC<ChatProps> = ({
+  items,
+  onSendMessage,
+  onApprovalResponse,
+}) => {
   const itemsEndRef = useRef<HTMLDivElement>(null);
   const [inputMessageText, setinputMessageText] = useState<string>("");
   // This state is used to provide better user experience for non-English IMEs such as Japanese
   const [isComposing, setIsComposing] = useState(false);
+  const { isAssistantLoading } = useConversationStore();
 
   const scrollToBottom = () => {
     itemsEndRef.current?.scrollIntoView({ behavior: "instant" });
   };
 
-  const handleKeyDown = useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (event.key === "Enter" && !event.shiftKey && !isComposing) {
-      event.preventDefault();
-      onSendMessage(inputMessageText);
-      setinputMessageText("");
-    }
-  }, [onSendMessage, inputMessageText]);
+  const handleKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (event.key === "Enter" && !event.shiftKey && !isComposing) {
+        event.preventDefault();
+        onSendMessage(inputMessageText);
+        setinputMessageText("");
+      }
+    },
+    [onSendMessage, inputMessageText, isComposing]
+  );
 
   useEffect(() => {
     scrollToBottom();
@@ -53,9 +66,17 @@ const Chat: React.FC<ChatProps> = ({ items, onSendMessage }) => {
                         />
                       )}
                   </div>
+                ) : item.type === "mcp_list_tools" ? (
+                  <McpToolsList item={item} />
+                ) : item.type === "mcp_approval_request" ? (
+                  <McpApproval
+                    item={item as McpApprovalRequestItem}
+                    onRespond={onApprovalResponse}
+                  />
                 ) : null}
               </React.Fragment>
             ))}
+            {isAssistantLoading && <LoadingMessage />}
             <div ref={itemsEndRef} />
           </div>
         </div>
@@ -83,7 +104,7 @@ const Chat: React.FC<ChatProps> = ({ items, onSendMessage }) => {
                     disabled={!inputMessageText}
                     data-testid="send-button"
                     className="flex size-8 items-end justify-center rounded-full bg-black text-white transition-colors hover:opacity-70 focus-visible:outline-none focus-visible:outline-black disabled:bg-[#D7D7D7] disabled:text-[#f4f4f4] disabled:hover:opacity-100"
-                    onClick={() => {
+                  onClick={() => {
                       onSendMessage(inputMessageText);
                       setinputMessageText("");
                     }}

@@ -10,8 +10,11 @@ export const getTools = () => {
     webSearchEnabled,
     fileSearchEnabled,
     functionsEnabled,
+    codeInterpreterEnabled,
     vectorStore,
     webSearchConfig,
+    mcpEnabled,
+    mcpConfig,
   } = useToolsStore.getState();
 
   const tools = [];
@@ -40,6 +43,10 @@ export const getTools = () => {
     tools.push(fileSearchTool);
   }
 
+  if (codeInterpreterEnabled) {
+    tools.push({ type: "code_interpreter", container: { type: "auto" } });
+  }
+
   if (functionsEnabled) {
     tools.push(
       ...toolsList.map((tool) => {
@@ -57,6 +64,24 @@ export const getTools = () => {
         };
       })
     );
+  }
+
+  if (mcpEnabled && mcpConfig.server_url && mcpConfig.server_label) {
+    const mcpTool: any = {
+      type: "mcp",
+      server_label: mcpConfig.server_label,
+      server_url: mcpConfig.server_url,
+    };
+    if (mcpConfig.skip_approval) {
+      mcpTool.require_approval = "never";
+    }
+    if (mcpConfig.allowed_tools.trim()) {
+      mcpTool.allowed_tools = mcpConfig.allowed_tools
+        .split(",")
+        .map((t) => t.trim())
+        .filter((t) => t);
+    }
+    tools.push(mcpTool);
   }
 
   console.log("tools", tools);

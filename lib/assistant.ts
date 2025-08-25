@@ -1,10 +1,16 @@
-import { DEVELOPER_PROMPT } from "@/config/constants";
 import { parse } from "partial-json";
 import { handleTool } from "@/lib/tools/tools-handling";
 import useConversationStore from "@/stores/useConversationStore";
 import { getTools } from "./tools/tools";
+import useToolsStore from "@/stores/useToolsStore";
 import { Annotation } from "@/components/annotations";
 import { functionsMap } from "@/config/functions";
+
+const normalizeAnnotation = (annotation: any): Annotation => ({
+  ...annotation,
+  fileId: annotation.file_id ?? annotation.fileId,
+  containerId: annotation.container_id ?? annotation.containerId,
+});
 
 export interface ContentItem {
   type: "input_text" | "output_text" | "refusal" | "output_audio";
@@ -23,7 +29,12 @@ export interface MessageItem {
 // Custom items to display in chat
 export interface ToolCallItem {
   type: "tool_call";
-  tool_type: "file_search_call" | "web_search_call" | "function_call";
+  tool_type:
+    | "file_search_call"
+    | "web_search_call"
+    | "function_call"
+    | "mcp_call"
+    | "code_interpreter_call";
   status: "in_progress" | "completed" | "failed" | "searching";
   id: string;
   name?: string | null;
@@ -31,9 +42,35 @@ export interface ToolCallItem {
   arguments?: string;
   parsedArguments?: any;
   output?: string | null;
+  code?: string;
+  files?: {
+    file_id: string;
+    mime_type: string;
+    container_id?: string;
+    filename?: string;
+  }[];
 }
 
-export type Item = MessageItem | ToolCallItem;
+export interface McpListToolsItem {
+  type: "mcp_list_tools";
+  id: string;
+  server_label: string;
+  tools: { name: string; description?: string }[];
+}
+
+export interface McpApprovalRequestItem {
+  type: "mcp_approval_request";
+  id: string;
+  server_label: string;
+  name: string;
+  arguments?: string;
+}
+
+export type Item =
+  | MessageItem
+  | ToolCallItem
+  | McpListToolsItem
+  | McpApprovalRequestItem;
 
 export const handleTurn = async (
   messages: any[],
@@ -41,6 +78,7 @@ export const handleTurn = async (
   onMessage: (data: any) => void
 ) => {
   try {
+    const { googleIntegrationEnabled } = useToolsStore.getState();
     // Get response from the API (defined in app/api/turn_response/route.ts)
     const response = await fetch("/api/turn_response", {
       method: "POST",
@@ -48,6 +86,7 @@ export const handleTurn = async (
       body: JSON.stringify({
         messages: messages,
         tools: tools,
+        googleIntegrationEnabled,
       }),
     });
 
@@ -103,20 +142,16 @@ export const processMessages = async () => {
     conversationItems,
     setChatMessages,
     setConversationItems,
+    setAssistantLoading,
   } = useConversationStore.getState();
 
   const tools = getTools();
-  const allConversationItems = [
-    // Adding developer prompt as first item in the conversation
-    {
-      role: "developer",
-      content: DEVELOPER_PROMPT,
-    },
-    ...conversationItems,
-  ];
+  const allConversationItems = conversationItems;
 
   let assistantMessageContent = "";
   let functionArguments = "";
+  // For streaming MCP tool call arguments
+  let mcpArguments = "";
 
   await handleTurn(allConversationItems, tools, async ({ event, data }) => {
     switch (event) {
@@ -156,13 +191,14 @@ export const processMessages = async () => {
             if (annotation) {
               contentItem.annotations = [
                 ...(contentItem.annotations ?? []),
-                annotation,
+                normalizeAnnotation(annotation),
               ];
             }
           }
         }
 
         setChatMessages([...chatMessages]);
+        setAssistantLoading(false);
         break;
       }
 
@@ -172,10 +208,13 @@ export const processMessages = async () => {
         if (!item || !item.type) {
           break;
         }
+        setAssistantLoading(false);
         // Handle differently depending on the item type
         switch (item.type) {
           case "message": {
             const text = item.content?.text || "";
+            const annotations =
+              item.content?.annotations?.map(normalizeAnnotation) || [];
             chatMessages.push({
               type: "message",
               role: "assistant",
@@ -183,6 +222,7 @@ export const processMessages = async () => {
                 {
                   type: "output_text",
                   text,
+                  ...(annotations.length > 0 ? { annotations } : {}),
                 },
               ],
             });
@@ -192,6 +232,7 @@ export const processMessages = async () => {
                 {
                   type: "output_text",
                   text,
+                  ...(annotations.length > 0 ? { annotations } : {}),
                 },
               ],
             });
@@ -230,6 +271,33 @@ export const processMessages = async () => {
               tool_type: "file_search_call",
               status: item.status || "in_progress",
               id: item.id,
+            });
+            setChatMessages([...chatMessages]);
+            break;
+          }
+          case "mcp_call": {
+            mcpArguments = item.arguments || "";
+            chatMessages.push({
+              type: "tool_call",
+              tool_type: "mcp_call",
+              status: "in_progress",
+              id: item.id,
+              name: item.name,
+              arguments: item.arguments || "",
+              parsedArguments: item.arguments ? parse(item.arguments) : {},
+              output: null,
+            });
+            setChatMessages([...chatMessages]);
+            break;
+          }
+          case "code_interpreter_call": {
+            chatMessages.push({
+              type: "tool_call",
+              tool_type: "code_interpreter_call",
+              status: item.status || "in_progress",
+              id: item.id,
+              code: "",
+              files: [],
             });
             setChatMessages([...chatMessages]);
             break;
@@ -273,6 +341,16 @@ export const processMessages = async () => {
           // Create another turn after tool output has been added
           await processMessages();
         }
+        if (
+          toolCallMessage &&
+          toolCallMessage.type === "tool_call" &&
+          toolCallMessage.tool_type === "mcp_call"
+        ) {
+          toolCallMessage.output = item.output;
+          toolCallMessage.status = "completed";
+          setChatMessages([...chatMessages]);
+        }
+        break;
       }
 
       case "response.function_call_arguments.delta": {
@@ -312,6 +390,39 @@ export const processMessages = async () => {
         }
         break;
       }
+      // Streaming MCP tool call arguments
+      case "response.mcp_call_arguments.delta": {
+        // Append delta to MCP arguments
+        mcpArguments += data.delta || "";
+        let parsedMcpArguments: any = {};
+        const toolCallMessage = chatMessages.find((m) => m.id === data.item_id);
+        if (toolCallMessage && toolCallMessage.type === "tool_call") {
+          toolCallMessage.arguments = mcpArguments;
+          try {
+            if (mcpArguments.length > 0) {
+              parsedMcpArguments = parse(mcpArguments);
+            }
+            toolCallMessage.parsedArguments = parsedMcpArguments;
+          } catch {
+            // partial JSON can fail parse; ignore
+          }
+          setChatMessages([...chatMessages]);
+        }
+        break;
+      }
+      case "response.mcp_call_arguments.done": {
+        // Final MCP arguments string received
+        const { item_id, arguments: finalArgs } = data;
+        mcpArguments = finalArgs;
+        const toolCallMessage = chatMessages.find((m) => m.id === item_id);
+        if (toolCallMessage && toolCallMessage.type === "tool_call") {
+          toolCallMessage.arguments = finalArgs;
+          toolCallMessage.parsedArguments = parse(finalArgs);
+          toolCallMessage.status = "completed";
+          setChatMessages([...chatMessages]);
+        }
+        break;
+      }
 
       case "response.web_search_call.completed": {
         const { item_id, output } = data;
@@ -332,6 +443,98 @@ export const processMessages = async () => {
           toolCallMessage.status = "completed";
           setChatMessages([...chatMessages]);
         }
+        break;
+      }
+
+      case "response.code_interpreter_call_code.delta": {
+        const { delta, item_id } = data;
+        const toolCallMessage = [...chatMessages]
+          .reverse()
+          .find(
+            (m) =>
+              m.type === "tool_call" &&
+              m.tool_type === "code_interpreter_call" &&
+              m.status !== "completed" &&
+              m.id === item_id
+          ) as ToolCallItem | undefined;
+        // Accumulate deltas to show the code streaming
+        if (toolCallMessage) {
+          toolCallMessage.code = (toolCallMessage.code || "") + delta;
+          setChatMessages([...chatMessages]);
+        }
+        break;
+      }
+
+      case "response.code_interpreter_call_code.done": {
+        const { code, item_id } = data;
+        const toolCallMessage = [...chatMessages]
+          .reverse()
+          .find(
+            (m) =>
+              m.type === "tool_call" &&
+              m.tool_type === "code_interpreter_call" &&
+              m.status !== "completed" &&
+              m.id === item_id
+          ) as ToolCallItem | undefined;
+
+        // Mark the call as completed and set the code
+        if (toolCallMessage) {
+          toolCallMessage.code = code;
+          toolCallMessage.status = "completed";
+          setChatMessages([...chatMessages]);
+        }
+        break;
+      }
+
+      case "response.code_interpreter_call.completed": {
+        const { item_id } = data;
+        const toolCallMessage = chatMessages.find(
+          (m) => m.type === "tool_call" && m.id === item_id
+        ) as ToolCallItem | undefined;
+        if (toolCallMessage) {
+          toolCallMessage.status = "completed";
+          setChatMessages([...chatMessages]);
+        }
+        break;
+      }
+
+      case "response.completed": {
+        console.log("response completed", data);
+        const { response } = data;
+
+        // Handle MCP tools list (append all lists, not just the first)
+        const mcpListToolsMessages = response.output.filter(
+          (m: Item) => m.type === "mcp_list_tools"
+        ) as McpListToolsItem[];
+
+        if (mcpListToolsMessages && mcpListToolsMessages.length > 0) {
+          for (const msg of mcpListToolsMessages) {
+            chatMessages.push({
+              type: "mcp_list_tools",
+              id: msg.id,
+              server_label: msg.server_label,
+              tools: msg.tools || [],
+            });
+          }
+          setChatMessages([...chatMessages]);
+        }
+
+        // Handle MCP approval request
+        const mcpApprovalRequestMessage = response.output.find(
+          (m: Item) => m.type === "mcp_approval_request"
+        );
+
+        if (mcpApprovalRequestMessage) {
+          chatMessages.push({
+            type: "mcp_approval_request",
+            id: mcpApprovalRequestMessage.id,
+            server_label: mcpApprovalRequestMessage.server_label,
+            name: mcpApprovalRequestMessage.name,
+            arguments: mcpApprovalRequestMessage.arguments,
+          });
+          setChatMessages([...chatMessages]);
+        }
+
         break;
       }
 
